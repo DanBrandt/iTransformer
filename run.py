@@ -55,6 +55,8 @@ if __name__ == '__main__':
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
     parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
     parser.add_argument('--do_predict', action='store_true', help='whether to predict unseen future data')
+    parser.add_argument('--run_ensemble', action='store_true', help='run MC dropout ensemble during inference')
+    parser.add_argument('--ensemble_members', type=int, default=20, help='number of ensemble members')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')

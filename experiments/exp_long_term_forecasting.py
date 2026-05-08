@@ -9,9 +9,28 @@ import os
 import time
 import warnings
 import numpy as np
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
+class QuantileLoss(nn.Module):
+    def __init__(self, quantiles=[0.1, 0.5, 0.9]):
+        super(QuantileLoss, self).__init__()
+        self.quantiles = quantiles
+
+    def forward(self, preds, target):
+        # target shape: [batch, horizon, 1]
+        # preds shape: [batch, horizon, 3]
+        assert preds.shape[-1] == len(self.quantiles)
+
+        loss = []
+        for i, q in enumerate(self.quantiles):
+            errors = target - preds[:, :, i:i + 1]
+            loss.append(torch.max(q * errors, (q - 1) * errors).unsqueeze(-1))
+
+        # Combine losses for all quantiles
+        combined_loss = torch.cat(loss, dim=-1).mean()
+        return combined_loss
 
 class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
@@ -34,6 +53,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def _select_criterion(self):
         criterion = nn.MSELoss()
+        # criterion = QuantileLoss(quantiles=[0.1, 0.5, 0.9])
         return criterion
 
     def vali(self, vali_data, vali_loader, criterion):
@@ -68,16 +88,22 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                if outputs.shape[-1] > 1:
+                    outputs = outputs[:, :, -3:]
+                    batch_y = batch_y[:, -self.args.pred_len:, -1:].to(self.device)
 
                 pred = outputs.detach().cpu()
                 true = batch_y.detach().cpu()
 
-                loss = criterion(pred, true)
-
+                if outputs.shape[-1] > 1:
+                    loss = criterion(outputs, batch_y)
+                else:
+                    loss = criterion(pred, true)
                 total_loss.append(loss)
         total_loss = np.average(total_loss)
         self.model.train()
-        return total_loss
+        rmse = np.sqrt(total_loss)
+        return total_loss, rmse
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -142,7 +168,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                     f_dim = -1 if self.args.features == 'MS' else 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                    if outputs.shape[-1] > 1:
+                        outputs = outputs[:, :, -3:]
+                        batch_y = batch_y[:, -self.args.pred_len:, -1:].to(self.device)
+                    else:
+                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
                     train_loss.append(loss.item())
 
@@ -164,8 +194,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
-            vali_loss = self.vali(vali_data, vali_loader, criterion)
-            test_loss = self.vali(test_data, test_loader, criterion)
+            vali_loss, vali_rmse = self.vali(vali_data, vali_loader, criterion)
+            test_loss, test_rmse = self.vali(test_data, test_loader, criterion)
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
@@ -195,61 +225,90 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
-        self.model.eval()
+        # Determine how many passes to make
+        # If not in ensemble mode, iterations = 1
+        iterations = self.args.ensemble_members if self.args.run_ensemble else 1
+        ## This unlocks the dropout layers so that an ensemble of outputs can be generated
+        if self.args.run_ensemble:
+            self.model.eval()
+            for m in self.model.modules():
+                if m.__class__.__name__.startswith('Dropout'):
+                    m.train()
+        else:
+            self.model.eval()  # Standard deterministic mode
+        ##
+        all_preds = []
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
-                batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+            print('Running an ensemble with '+str(iterations)+' members...')
+            for _ in tqdm(range(iterations)):
+                preds = []
+                trues = []
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+                    batch_x = batch_x.float().to(self.device)
+                    batch_y = batch_y.float().to(self.device)
 
-                if 'PEMS' in self.args.data or 'Solar' in self.args.data:
-                    batch_x_mark = None
-                    batch_y_mark = None
-                else:
-                    batch_x_mark = batch_x_mark.float().to(self.device)
-                    batch_y_mark = batch_y_mark.float().to(self.device)
+                    if 'PEMS' in self.args.data or 'Solar' in self.args.data:
+                        batch_x_mark = None
+                        batch_y_mark = None
+                    else:
+                        batch_x_mark = batch_x_mark.float().to(self.device)
+                        batch_y_mark = batch_y_mark.float().to(self.device)
 
-                # decoder input
-                dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
-                dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
+                    # decoder input
+                    dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
+                    dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
+                    # encoder - decoder
+                    if self.args.use_amp:
+                        with torch.cuda.amp.autocast():
+                            if self.args.output_attention:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                            else:
+                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    else:
                         if self.args.output_attention:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+
                         else:
                             outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
 
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                outputs = outputs.detach().cpu().numpy()
-                batch_y = batch_y.detach().cpu().numpy()
-                if test_data.scale and self.args.inverse:
-                    shape = outputs.shape
-                    outputs = test_data.inverse_transform(outputs.squeeze(0)).reshape(shape)
-                    batch_y = test_data.inverse_transform(batch_y.squeeze(0)).reshape(shape)
-
-                pred = outputs
-                true = batch_y
-
-                preds.append(pred)
-                trues.append(true)
-                if i % 20 == 0:
-                    input = batch_x.detach().cpu().numpy()
+                    f_dim = -1 if self.args.features == 'MS' else 0
+                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                    outputs = outputs.detach().cpu().numpy()
+                    batch_y = batch_y.detach().cpu().numpy()
                     if test_data.scale and self.args.inverse:
-                        shape = input.shape
-                        input = test_data.inverse_transform(input.squeeze(0)).reshape(shape)
-                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
-                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
-                    visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+                        shape = outputs.shape
+                        outputs = test_data.inverse_transform(outputs.squeeze(0)).reshape(shape)
+                        batch_y = test_data.inverse_transform(batch_y.squeeze(0)).reshape(shape)
 
-        preds = np.array(preds)
+                    pred = outputs
+                    true = batch_y
+
+                    preds.append(pred)
+                    trues.append(true)
+                    if i % 20 == 0:
+                        input = batch_x.detach().cpu().numpy()
+                        if test_data.scale and self.args.inverse:
+                            shape = input.shape
+                            input = test_data.inverse_transform(input.squeeze(0)).reshape(shape)
+                        gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
+                        pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
+                        visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+                all_preds.append(preds)
+        print('Complete!')
+
+        # Conditional Statistics
+        if self.args.run_ensemble:
+            all_preds = np.stack(all_preds, axis=0)
+            prediction_median = np.median(all_preds, axis=0)
+            prediction_std = np.squeeze(np.std(all_preds, axis=0))
+            # Save both or return both for CI calculation
+        else:
+            # Standard output: squeeze the ensemble dimension of 1
+            prediction_median = np.asarray(all_preds[0])
+            prediction_std = np.zeros_like(prediction_median)  # No uncertainty
+
+        preds = prediction_median # np.array(preds)
         trues = np.array(trues)
         print('test shape:', preds.shape, trues.shape)
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
@@ -270,9 +329,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         f.write('\n')
         f.close()
 
+        # Confidence intervals on outputs:
+        # train_data, train_loader = self._get_data(flag='train')
+        # dcx_std = train_data.scaler.scale_[-1]  # Assuming Dcx is the last column
+        # print('Dcx standard error: '+str(dcx_std/np.sqrt(len(train_data))))
+
         np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
         np.save(folder_path + 'pred.npy', preds)
         np.save(folder_path + 'true.npy', trues)
+        np.save(folder_path + 'confi.npy', prediction_std)
 
         return
 
@@ -288,6 +353,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         preds = []
 
         self.model.eval()
+        ## This unlocks the dropout layers so that an ensemble of outputs can be generated
+        for m in self.model.modules():
+            if m.__class__.__name__.startswith('Dropout'):
+                m.train()  # Force ONLY dropout layers into train mode
+        ##
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
                 batch_x = batch_x.float().to(self.device)
